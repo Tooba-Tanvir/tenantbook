@@ -1,0 +1,58 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Tenant {
+  id        String    @id @default(cuid())
+  name      String
+  slug      String    @unique
+  createdAt DateTime  @default(now())
+  roles     Role[]
+  users     User[]
+  bookings  Booking[]
+}
+
+model Role {
+  id       String @id @default(cuid())
+  tenantId String
+  name     String // OWNER, ADMIN, MEMBER
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  users    User[]
+
+  @@unique([tenantId, name])
+}
+
+model User {
+  id           String    @id @default(cuid())
+  tenantId     String
+  roleId       String
+  email        String
+  name         String
+  passwordHash String
+  createdAt    DateTime  @default(now())
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  role         Role      @relation(fields: [roleId], references: [id])
+  bookings     Booking[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+}
+
+model Booking {
+  id       String   @id @default(cuid())
+  tenantId String
+  userId   String
+  title    String
+  startsAt DateTime
+  endsAt   DateTime
+  status   String   @default("CONFIRMED")
+  tenant   Tenant   @relation(fields: [tenantId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, startsAt])
+}
