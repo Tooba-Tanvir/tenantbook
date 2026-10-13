@@ -56,3 +56,14 @@ model Booking {
 
   @@index([tenantId, startsAt])
 }
+model IdempotencyKey {
+  id             String   @id @default(cuid())
+  tenantId       String
+  key            String
+  requestHash    String
+  responseStatus Int
+  responseBody   Json
+  createdAt      DateTime @default(now())
+
+  @@unique([tenantId, key])
+}
