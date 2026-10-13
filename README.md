@@ -192,9 +192,9 @@ Import `docs/tenantbook.postman_collection.json` into Postman or Insomnia.
 |---|---|
 | ![Calendar](docs/screenshots/calendar.png) | ![Create](docs/screenshots/create.png) |
 
-| Mobile agenda | Booking detail |
-|---|---|
-| ![Mobile](docs/screenshots/mobile.png) | ![Detail](docs/screenshots/detail.png) |
+| Booking detail |
+| ---|
+| ![Detail](docs/screenshots/detail.png) |
 
 ## Local Setup
 
