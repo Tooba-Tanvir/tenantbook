@@ -8,6 +8,8 @@ export type ErrorCode =
   | "FORBIDDEN"
   | "NOT_FOUND"
   | "IDEMPOTENCY_KEY_REUSED"
+  | "CONFLICT"
+  | "PLAN_LIMIT_REACHED"
   | "INTERNAL_ERROR";
 
 export type ErrorDetail = { path: string; message: string };

@@ -1,6 +1,6 @@
 # TenantBook
 
-A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every organization (tenant) gets its own isolated data, enforced at the database level with PostgreSQL Row-Level Security (RLS). Users manage bookings through idempotent REST APIs and a responsive calendar UI.
+A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every organization (tenant) gets its own isolated data, enforced at the database level with PostgreSQL Row-Level Security (RLS). Users manage bookings through idempotent REST APIs and a responsive calendar UI, and organizations pay for plans through Stripe subscriptions.
 
 ## What I Built
 
@@ -21,6 +21,15 @@ A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every
 - Mobile layout: month grid on desktop, agenda list on small screens
 - Postman collection in `docs/`
 
+**Week 3: Stripe subscriptions**
+- Stripe Checkout for subscribing to the Pro and Business plans
+- Plan upgrade and downgrade for existing subscriptions, with proration
+- Stripe Customer Portal for payment methods and cancellation
+- **Secure webhook handler** with signature verification and duplicate-event protection
+- Subscription and invoice state stored per tenant and protected by RLS
+- Pricing page, billing page and invoice history page
+- Webhook-driven UI: the interface polls until the webhook has updated the database, then confirms with a toast
+
 ## Tech Stack
 
 - **Framework:** Next.js (App Router) + TypeScript
@@ -30,13 +39,17 @@ A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every
 - **Validation:** Zod (API, env vars, forms), React Hook Form
 - **Client data:** TanStack React Query, Sonner (toasts), date-fns
 - **Auth:** bcrypt password hashing, `jose` for JWT sessions
+- **Payments:** Stripe (Checkout, Billing, Customer Portal, Webhooks)
 
 ## Approach and Design Decisions
 
 ### 1. Tenant isolation in the database
 Isolation is enforced by PostgreSQL RLS, not only by application code. Every request runs inside `withTenant(tenantId, fn)`, which opens a transaction and sets `app.tenant_id` using `set_config(..., true)`. The value is local to that transaction, so it cannot leak between requests. If no tenant is set, queries return zero rows.
 
-Because `Tenant` is also protected by RLS, login uses a `SECURITY DEFINER` function, `resolve_tenant(slug)`, to map an organization slug to its ID before any tenant context exists.
+Some code runs before a tenant is known (login, and Stripe webhooks, which have no session cookie). For these, `SECURITY DEFINER` functions map an identifier to a tenant ID:
+
+- `resolve_tenant(slug)` for login
+- `resolve_tenant_by_customer(stripeCustomerId)` for webhooks
 
 ### 2. Idempotent booking creation
 `POST /api/bookings` requires an `Idempotency-Key` header (the client generates a UUID once per form submit).
@@ -66,8 +79,9 @@ Every endpoint returns errors in one shape, built by a single `handle()` wrapper
 |---|---|---|
 | `VALIDATION_ERROR` | 400 | Body, query or header failed validation |
 | `UNAUTHORIZED` | 401 | Missing, expired or invalid session |
-| `FORBIDDEN` | 403 | Role not allowed (e.g. MEMBER editing another user's booking) |
-| `NOT_FOUND` | 404 | Booking does not exist in this tenant |
+| `FORBIDDEN` | 403 | Role not allowed (e.g. MEMBER managing billing) |
+| `NOT_FOUND` | 404 | Resource does not exist in this tenant |
+| `CONFLICT` | 409 | Action conflicts with current state (e.g. already subscribed) |
 | `IDEMPOTENCY_KEY_REUSED` | 422 | Same key sent with a different body |
 | `INTERNAL_ERROR` | 500 | Unexpected error (details logged server-side by `requestId`) |
 
@@ -79,6 +93,56 @@ Every endpoint returns errors in one shape, built by a single `handle()` wrapper
 - A 401 response redirects to `/login`.
 - Delete is optimistic: the row disappears immediately and is restored if the request fails.
 
+## Billing Architecture
+
+**Rule: the database changes only from webhooks.** The checkout redirect only brings the user back to the app. It never grants a plan. Stripe is the source of truth, and the webhook copies its state into our database.
+
+```mermaid
+sequenceDiagram
+  participant U as Browser
+  participant A as Next.js API
+  participant S as Stripe
+  participant D as PostgreSQL
+
+  U->>A: POST /api/billing/checkout (plan)
+  A->>S: Create customer + Checkout session
+  A-->>U: { url }
+  U->>S: Pay on Stripe Checkout
+  S-->>U: Redirect to /billing?checkout=success
+  S->>A: POST /api/webhooks/stripe (signed event)
+  A->>A: Verify signature on raw body
+  A->>S: Retrieve latest subscription
+  A->>D: Claim event id + upsert Subscription (one transaction)
+  U->>A: Poll GET /api/billing/subscription
+  A-->>U: plan = PRO, status = active
+  U->>U: Show success toast
+```
+
+### Plans
+
+| Plan | Price | Booking limit |
+|---|---|---|
+| Free | $0 | 20 / month |
+| Pro | $19 / month | 500 / month |
+| Business | $49 / month | Unlimited |
+
+Only OWNER and ADMIN users can start checkout, change plans or open the portal. MEMBER users can view billing but get `403` on changes.
+
+### Plan changes
+`POST /api/billing/change-plan` updates the Stripe subscription with proration and returns `202 Accepted`. It does **not** write the new plan to the database. The webhook does, and the UI polls until the plan matches the target.
+
+## Webhook Security
+
+`POST /api/webhooks/stripe` is a public endpoint, so it treats every request as untrusted until proven otherwise.
+
+1. **Signature verification.** The raw request body (`req.text()`, never parsed JSON) is verified against the `Stripe-Signature` header using the webhook secret. Invalid or missing signatures return `400` before any other work happens.
+2. **Duplicate protection.** Each Stripe event ID is inserted into the `StripeEvent` table with `ON CONFLICT DO NOTHING`. If the insert claims nothing, the event is a duplicate and the handler returns `200` with `"result":"duplicate"` without changing data.
+3. **One transaction.** The event-ID insert and the state change run in the same transaction. If applying the change fails, the transaction rolls back, the event ID is not stored, and Stripe's retry is processed properly. If it succeeds, any later redelivery is ignored.
+4. **Out-of-order events.** For subscription events, the handler fetches the latest subscription from Stripe instead of trusting the event payload, so an older event cannot overwrite newer data.
+5. **Tenant lookup without a session.** The tenant comes from Stripe metadata or from `resolve_tenant_by_customer()`. Events with no matching tenant are acknowledged and logged so Stripe does not retry forever.
+
+Handled events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.finalized`, `invoice.paid`, `invoice.payment_failed`. Other event types are acknowledged and ignored.
+
 ## Entity Relationship Diagram
 
 ```mermaid
@@ -87,6 +151,8 @@ erDiagram
   TENANT ||--o{ USER : has
   TENANT ||--o{ BOOKING : has
   TENANT ||--o{ IDEMPOTENCY_KEY : has
+  TENANT ||--o| SUBSCRIPTION : has
+  TENANT ||--o{ INVOICE : has
   ROLE ||--o{ USER : assigned_to
   USER ||--o{ BOOKING : creates
 
@@ -128,7 +194,35 @@ erDiagram
     json responseBody
     datetime createdAt
   }
+  SUBSCRIPTION {
+    string id PK
+    string tenantId UK
+    string stripeCustomerId UK
+    string stripeSubscriptionId UK
+    string plan "FREE, PRO, BUSINESS"
+    string status "none, active, trialing, past_due, canceled"
+    datetime currentPeriodEnd
+    boolean cancelAtPeriodEnd
+  }
+  INVOICE {
+    string id PK "Stripe invoice id"
+    string tenantId FK
+    string number
+    int amountPaid "cents"
+    string currency
+    string status
+    string hostedInvoiceUrl
+    string pdfUrl
+    datetime createdAt
+  }
+  STRIPE_EVENT {
+    string id PK "Stripe event id"
+    string type
+    datetime processedAt
+  }
 ```
+
+`StripeEvent` has no `tenantId` and no RLS. It stores only event IDs and is written only by the webhook route.
 
 ## Tenant Isolation Boundaries
 
@@ -145,15 +239,16 @@ flowchart LR
 
 | Boundary | Enforced by |
 |---|---|
-| Row visibility between tenants | PostgreSQL RLS policies on every table |
+| Row visibility between tenants | PostgreSQL RLS policies on every tenant table |
 | Cross-tenant writes | `WITH CHECK` clause on each policy |
 | Privilege separation | `owner` (migrations, seed) vs `app_user` (runtime, `NOBYPASSRLS`) |
 | Per-request scoping | `withTenant()` transaction wrapper |
 | Login before tenant is known | `resolve_tenant()` `SECURITY DEFINER` function |
+| Webhook before tenant is known | `resolve_tenant_by_customer()` `SECURITY DEFINER` function |
 
 ## API Reference
 
-All booking endpoints require the session cookie from login. Errors use the standard shape above.
+All endpoints except login and the webhook require the session cookie. Errors use the standard shape above.
 
 | Method | Path | Auth | Idempotent | Description |
 |---|---|---|---|---|
@@ -164,6 +259,12 @@ All booking endpoints require the session cookie from login. Errors use the stan
 | GET | `/api/bookings/:id` | Yes | Yes | Get one booking |
 | PATCH | `/api/bookings/:id` | Yes | Yes | Update fields. MEMBER: own bookings only |
 | DELETE | `/api/bookings/:id` | Yes | Yes | Delete; returns `204` even if already deleted |
+| POST | `/api/billing/checkout` | OWNER, ADMIN | Optional `Idempotency-Key` | Create a Stripe Checkout session, returns `{ url }` |
+| POST | `/api/billing/change-plan` | OWNER, ADMIN | Yes (same target plan returns `409`) | Upgrade or downgrade; returns `202`, plan updates via webhook |
+| POST | `/api/billing/portal` | OWNER, ADMIN | Yes | Open the Stripe Customer Portal |
+| GET | `/api/billing/subscription` | Yes | Yes | Current plan and status from the database |
+| GET | `/api/billing/invoices` | Yes | Yes | Invoice history from the database |
+| POST | `/api/webhooks/stripe` | Stripe signature | Yes, via event-ID dedup | Receive and apply Stripe events |
 
 **Create booking body**
 
@@ -193,8 +294,16 @@ Import `docs/tenantbook.postman_collection.json` into Postman or Insomnia.
 | ![Calendar](docs/screenshots/calendar.png) | ![Create](docs/screenshots/create.png) |
 
 | Booking detail |
-| ---|
+|---|
 | ![Detail](docs/screenshots/detail.png) |
+
+| Pricing page | Billing page |
+|---|---|
+| ![Pricing](docs/screenshots/pricing.png) | ![Billing](docs/screenshots/billing.png) |
+
+| Invoice history | Confirming payment banner |
+|---|---|
+| ![Invoices](docs/screenshots/invoices.png) | ![Confirming](docs/screenshots/confirming.png) |
 
 ## Local Setup
 
@@ -203,6 +312,7 @@ Import `docs/tenantbook.postman_collection.json` into Postman or Insomnia.
 - Node.js 20.19+ (or 22.12+ / 24+), required by Prisma 7
 - Docker Desktop
 - Git
+- A Stripe account in test mode and the Stripe CLI
 
 ### Steps
 
@@ -216,7 +326,7 @@ cp .env.example .env
 # 3. Start PostgreSQL (creates owner and app_user roles via docker/init.sql)
 docker compose up -d
 
-# 4. Apply migrations (tables, RLS policies, resolve_tenant, grants)
+# 4. Apply migrations (tables, RLS policies, functions, grants)
 npx prisma migrate deploy
 
 # 5. Generate the Prisma client
@@ -238,8 +348,50 @@ On Windows PowerShell, use `Copy-Item .env.example .env` for step 2. Open [http:
 | `DATABASE_URL` | App connection, as `app_user` (RLS enforced) |
 | `DIRECT_URL` | Migrations and seed, as `owner` |
 | `AUTH_SECRET` | JWT signing secret, at least 32 characters |
+| `STRIPE_SECRET_KEY` | Stripe secret key (`sk_test_...`) |
+| `STRIPE_WEBHOOK_SECRET` | Webhook signing secret (`whsec_...`) printed by `stripe listen` |
+| `STRIPE_PRICE_PRO` | Stripe price ID of the Pro plan (`price_...`) |
+| `STRIPE_PRICE_BUSINESS` | Stripe price ID of the Business plan (`price_...`) |
+| `APP_URL` | Base URL used for Stripe redirect links, e.g. `http://localhost:3000` |
 
-Variables are validated with Zod in `src/env.ts`; the app refuses to start if any are missing or invalid.
+Variables are validated with Zod in `src/env.ts`; the app refuses to start if any are missing or invalid. Never commit real keys: `.env` is git-ignored and `.env.example` holds placeholders only.
+
+### Stripe Setup (test mode)
+
+1. In the Stripe Dashboard (sandbox/test mode), create two products with monthly recurring prices: **Pro** ($19) and **Business** ($49). Copy each **price ID** (`price_...`, not the `prod_...` product ID) into `.env`.
+2. Copy the secret key from **Developers, API keys** into `STRIPE_SECRET_KEY`.
+3. Activate the **Customer portal** under **Settings, Billing, Customer portal**.
+4. Install the Stripe CLI and log in:
+```bash
+   stripe login
+```
+5. With the dev server running, forward webhooks in a second terminal:
+```bash
+   stripe listen --forward-to localhost:3000/api/webhooks/stripe
+```
+   Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` and restart the dev server.
+
+### Stripe Test Cards
+
+| Card | Behavior |
+|---|---|
+| `4242 4242 4242 4242` | Payment succeeds |
+| `4000 0000 0000 9995` | Declined: insufficient funds |
+| `4000 0000 0000 0341` | Attaches, then fails on renewal (use with a Stripe test clock to trigger `invoice.payment_failed`) |
+
+Use any future expiry date and any 3-digit CVC.
+
+### Testing the webhook
+
+```bash
+# Unsigned request must be rejected with 400
+curl -i -X POST http://localhost:3000/api/webhooks/stripe --data "{}"
+
+# Resend a real event to check duplicate protection
+stripe events resend evt_XXXXXXXX
+```
+
+The resent event returns `"result":"duplicate"` and the database is unchanged.
 
 ### Demo Logins
 
@@ -266,20 +418,28 @@ Run it twice: the second response has the same booking `id` and an `Idempotent-R
 ## Project Structure
 
 ```
-prisma/              schema, migrations (incl. RLS), seed
-docker/init.sql      creates the app_user role
-src/env.ts           Zod env validation
-src/lib/db.ts        Prisma client and withTenant()
-src/lib/api.ts       ApiError and handle() error wrapper
-src/lib/session.ts   JWT session cookie
-src/lib/validators/  Zod schemas
-src/app/api/         auth and booking route handlers
-src/app/bookings/    calendar, create, detail, edit pages
-src/components/      BookingForm, ConfirmDialog, StatusBadge
-docs/                Postman collection and screenshots
+prisma/                      schema, migrations (incl. RLS), seed
+docker/init.sql              creates the app_user role
+src/env.ts                   Zod env validation
+src/lib/db.ts                Prisma client and withTenant()
+src/lib/api.ts               ApiError and handle() error wrapper
+src/lib/session.ts           JWT session cookie
+src/lib/stripe.ts            Stripe client
+src/lib/plans.ts             Plan definitions and price-ID mapping
+src/lib/billing.ts           React Query hooks for billing and polling
+src/lib/validators/          Zod schemas
+src/app/api/                 auth, booking and billing route handlers
+src/app/api/webhooks/stripe  signed webhook handler
+src/app/bookings/            calendar, create, detail, edit pages
+src/app/pricing/             plans page and checkout flow
+src/app/billing/             current plan, portal link, invoice history
+src/components/              BookingForm, ConfirmDialog, StatusBadge
+docs/                        Postman collection and screenshots
 ```
 
 ## Known Limitations
 
-- Password reset and organization onboarding screens are not part of this week's scope.
+- Password reset and organization onboarding screens are not part of this scope.
 - The isolation test script is not yet automated.
+- Stripe runs in test mode only; no live keys are configured.
+- Booking limits per plan are defined in `src/lib/plans.ts`, but enforcement on `POST /api/bookings` is optional and only active if implemented.
