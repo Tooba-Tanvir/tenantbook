@@ -8,7 +8,7 @@ import { useBooking, useDeleteBooking } from "@/lib/bookings";
 import { notifyError } from "@/lib/notify";
 import StatusBadge from "@/components/StatusBadge";
 import ConfirmDialog from "@/components/ConfirmDialog";
-
+import BookingNotes from "@/components/BookingNotes";
 export default function BookingDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
@@ -59,6 +59,7 @@ export default function BookingDetailPage() {
         <Link href={`/bookings/${id}/edit`} className="flex-1 rounded-lg border px-4 py-2.5 text-center text-sm">Edit</Link>
         <button onClick={() => setConfirm(true)} className="flex-1 rounded-lg bg-red-600 px-4 py-2.5 text-sm text-white">Delete</button>
       </div>
+      <BookingNotes bookingId={id} />
       <ConfirmDialog
         open={confirm}
         title="Delete booking?"
@@ -67,5 +68,7 @@ export default function BookingDetailPage() {
         onCancel={() => setConfirm(false)}
       />
     </div>
+    
   );
+  
 }

@@ -53,7 +53,7 @@ model Booking {
   status   String   @default("CONFIRMED")
   tenant   Tenant   @relation(fields: [tenantId], references: [id])
   user     User     @relation(fields: [userId], references: [id])
-
+  note BookingNote?
   @@index([tenantId, startsAt])
 }
 model IdempotencyKey {
@@ -97,4 +97,16 @@ model StripeEvent {
   id          String   @id                 // Stripe event id (evt_...)
   type        String
   processedAt DateTime @default(now())
+}
+model BookingNote {
+  id        String   @id @default(cuid())
+  tenantId  String
+  bookingId String   @unique
+  content   String   @default("")
+  version   Int      @default(0)
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
 }

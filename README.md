@@ -1,6 +1,6 @@
 # TenantBook
 
-A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every organization (tenant) gets its own isolated data, enforced at the database level with PostgreSQL Row-Level Security (RLS). Users manage bookings through idempotent REST APIs and a responsive calendar UI, and organizations pay for plans through Stripe subscriptions.
+A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every organization (tenant) gets its own isolated data, enforced at the database level with PostgreSQL Row-Level Security (RLS). Users manage bookings through idempotent REST APIs and a responsive calendar UI, pay for plans through Stripe subscriptions, and collaborate on booking notes in real time.
 
 ## What I Built
 
@@ -22,13 +22,21 @@ A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every
 - Postman collection in `docs/`
 
 **Week 3: Stripe subscriptions**
-- Stripe Checkout for subscribing to the Pro and Business plans
-- Plan upgrade and downgrade for existing subscriptions, with proration
+- Stripe Checkout for the Pro and Business plans
+- Plan upgrade and downgrade with proration
 - Stripe Customer Portal for payment methods and cancellation
 - **Secure webhook handler** with signature verification and duplicate-event protection
 - Subscription and invoice state stored per tenant and protected by RLS
 - Pricing page, billing page and invoice history page
-- Webhook-driven UI: the interface polls until the webhook has updated the database, then confirms with a toast
+- Webhook-driven UI: polls until the webhook updates the database, then confirms with a toast
+
+**Week 4: Real-time collaborative notes**
+- Socket.io server (separate process) for live booking notes
+- Presence avatars showing who is viewing a booking, one avatar per user
+- Live typing indicators and a debounced auto-save status
+- **Optimistic concurrency control** with a note `version`, plus a conflict-resolution banner
+- Automatic reconnection with backoff, offline banner, and sync of edits made while offline
+- Automated Vitest suite that drives real socket connections
 
 ## Tech Stack
 
@@ -36,10 +44,12 @@ A multi-tenant booking platform built with Next.js, PostgreSQL and Prisma. Every
 - **Styling:** Tailwind CSS
 - **Database:** PostgreSQL 16 (Docker)
 - **ORM:** Prisma 7 with `@prisma/adapter-pg`
-- **Validation:** Zod (API, env vars, forms), React Hook Form
+- **Validation:** Zod (API, env vars, forms, socket payloads), React Hook Form
 - **Client data:** TanStack React Query, Sonner (toasts), date-fns
 - **Auth:** bcrypt password hashing, `jose` for JWT sessions
 - **Payments:** Stripe (Checkout, Billing, Customer Portal, Webhooks)
+- **Realtime:** Socket.io (server and client)
+- **Testing:** Vitest
 
 ## Approach and Design Decisions
 
@@ -137,11 +147,84 @@ Only OWNER and ADMIN users can start checkout, change plans or open the portal. 
 
 1. **Signature verification.** The raw request body (`req.text()`, never parsed JSON) is verified against the `Stripe-Signature` header using the webhook secret. Invalid or missing signatures return `400` before any other work happens.
 2. **Duplicate protection.** Each Stripe event ID is inserted into the `StripeEvent` table with `ON CONFLICT DO NOTHING`. If the insert claims nothing, the event is a duplicate and the handler returns `200` with `"result":"duplicate"` without changing data.
-3. **One transaction.** The event-ID insert and the state change run in the same transaction. If applying the change fails, the transaction rolls back, the event ID is not stored, and Stripe's retry is processed properly. If it succeeds, any later redelivery is ignored.
-4. **Out-of-order events.** For subscription events, the handler fetches the latest subscription from Stripe instead of trusting the event payload, so an older event cannot overwrite newer data.
+3. **One transaction.** The event-ID insert and the state change run in the same transaction. If applying the change fails, the transaction rolls back, the event ID is not stored, and Stripe's retry is processed properly.
+4. **Out-of-order events.** For subscription events, the handler fetches the latest subscription from Stripe instead of trusting the event payload.
 5. **Tenant lookup without a session.** The tenant comes from Stripe metadata or from `resolve_tenant_by_customer()`. Events with no matching tenant are acknowledged and logged so Stripe does not retry forever.
 
 Handled events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.finalized`, `invoice.paid`, `invoice.payment_failed`. Other event types are acknowledged and ignored.
+
+## Realtime Architecture
+
+Next.js route handlers cannot hold WebSocket connections, so Socket.io runs as its own Node process (default port 4000) next to the Next.js server.
+
+```mermaid
+sequenceDiagram
+  participant A as Browser A (Ali)
+  participant R as Socket.io server
+  participant D as PostgreSQL (RLS)
+  participant B as Browser B (Sara)
+
+  A->>R: connect (tb_session cookie)
+  R->>R: Verify JWT, derive tenantId
+  A->>R: note:join {bookingId}
+  R->>D: withTenant(tenantId): booking exists?
+  R-->>A: ack {note, viewers}
+  B->>R: note:join {bookingId}
+  R-->>A: presence:update (Ali, Sara)
+  A->>R: note:typing {typing: true}
+  R-->>B: note:typing (Ali is typing)
+  A->>R: note:save {content, baseVersion: 3}
+  R->>D: UPDATE ... WHERE version = 3
+  R-->>A: ack {ok, version: 4}
+  R-->>B: note:updated {content, version: 4}
+```
+
+**Authentication.** No new login. The browser sends the same `tb_session` cookie to the socket server (cookies ignore ports, so use `localhost` everywhere). The server verifies the JWT with `jose`. Connections without a valid session are rejected with `UNAUTHORIZED`.
+
+**Tenant isolation on sockets.**
+- The tenant comes only from the verified JWT, never from client input.
+- Rooms are named `t:{tenantId}:b:{bookingId}`, so events cannot cross organizations.
+- Joining checks the booking through `withTenant`, so RLS still applies. A user from another organization gets `NOT_FOUND`.
+
+**Testable core.** `createRealtime(httpServer, { auth, store })` takes injected authentication and storage. Production uses cookies and Prisma; tests use a token and an in-memory store, so the suite needs no database.
+
+### Socket events
+
+| Event | Direction | Payload | Purpose |
+|---|---|---|---|
+| `note:join` | client to server (ack) | `{ bookingId }` | Join the booking room; returns the note, viewers and own identity |
+| `note:leave` | client to server | `{ bookingId }` | Leave the room |
+| `note:typing` | client to server, then broadcast | `{ bookingId, typing }` | Typing indicator, sent to other viewers only |
+| `note:save` | client to server (ack) | `{ bookingId, content, baseVersion }` | Save with a version check |
+| `note:updated` | server to others | `{ bookingId, content, version, by }` | A viewer saved a new version |
+| `presence:update` | server to room | `{ bookingId, users[] }` | Current viewers, one entry per user |
+
+All payloads are validated with Zod on the server.
+
+### Concurrency control
+
+Each note has an integer `version`. A save sends the `baseVersion` it was based on, and the database applies the check inside the statement:
+
+```sql
+UPDATE "BookingNote"
+SET "content" = $1, "version" = "version" + 1
+WHERE "bookingId" = $2 AND "version" = $3
+RETURNING "version"
+```
+
+If no row is returned, someone else saved first, and the server replies `CONFLICT` with the latest note. Because the check is part of the `WHERE` clause, two simultaneous saves cannot both succeed.
+
+On a conflict, the UI shows a banner with the other person's version and two choices: **Load their version** (discard my edits) or **Keep mine** (rebase on the latest version and overwrite).
+
+I chose optimistic concurrency over document locking because locks need timeouts and cleanup when a user disconnects, and they block other people from typing. I chose it over Yjs (CRDTs) because notes are short, and a visible conflict prompt is simpler and easier to test.
+
+### Reconnection and offline behavior
+
+- Socket.io reconnects automatically with exponential backoff (1 to 8 seconds).
+- On every `connect`, the client re-sends `note:join`, which restores presence and fetches the latest note.
+- The browser's `online` and `offline` events drive a banner: amber "Reconnecting..." or red "You're offline".
+- Edits made while offline stay in the textarea. After reconnecting, if the server version is unchanged they are saved automatically; if someone else changed the note meanwhile, the conflict banner appears.
+- A "Back online. Notes synced." toast confirms recovery.
 
 ## Entity Relationship Diagram
 
@@ -155,6 +238,7 @@ erDiagram
   TENANT ||--o{ INVOICE : has
   ROLE ||--o{ USER : assigned_to
   USER ||--o{ BOOKING : creates
+  BOOKING ||--o| BOOKING_NOTE : has
 
   TENANT {
     string id PK
@@ -184,6 +268,15 @@ erDiagram
     datetime startsAt
     datetime endsAt
     string status "CONFIRMED, PENDING, CANCELLED"
+  }
+  BOOKING_NOTE {
+    string id PK
+    string tenantId FK
+    string bookingId UK
+    string content
+    int version "optimistic concurrency"
+    string updatedBy
+    datetime updatedAt
   }
   IDEMPOTENCY_KEY {
     string id PK
@@ -228,7 +321,7 @@ erDiagram
 
 ```mermaid
 flowchart LR
-  A[HTTP Request] --> B[Session cookie: tenantId]
+  A[HTTP or socket request] --> B[Session cookie: tenantId]
   B --> C["withTenant(tenantId, fn)"]
   C --> D["set_config('app.tenant_id', ..., true)"]
   D --> E[(PostgreSQL as app_user)]
@@ -245,6 +338,7 @@ flowchart LR
 | Per-request scoping | `withTenant()` transaction wrapper |
 | Login before tenant is known | `resolve_tenant()` `SECURITY DEFINER` function |
 | Webhook before tenant is known | `resolve_tenant_by_customer()` `SECURITY DEFINER` function |
+| Realtime rooms | Tenant from verified JWT, room names include the tenant ID, access checked through RLS |
 
 ## API Reference
 
@@ -265,6 +359,7 @@ All endpoints except login and the webhook require the session cookie. Errors us
 | GET | `/api/billing/subscription` | Yes | Yes | Current plan and status from the database |
 | GET | `/api/billing/invoices` | Yes | Yes | Invoice history from the database |
 | POST | `/api/webhooks/stripe` | Stripe signature | Yes, via event-ID dedup | Receive and apply Stripe events |
+| GET | `http://localhost:4000/health` | No | Yes | Realtime server health check (`ok`) |
 
 **Create booking body**
 
@@ -297,13 +392,14 @@ Import `docs/tenantbook.postman_collection.json` into Postman or Insomnia.
 |---|
 | ![Detail](docs/screenshots/detail.png) |
 
-| Pricing page | Billing page |
-|---|---|
-| ![Pricing](docs/screenshots/pricing.png) | ![Billing](docs/screenshots/billing.png) |
 
-| Invoice history | Confirming payment banner |
+| Presence and typing indicator | Conflict banner |
 |---|---|
-| ![Invoices](docs/screenshots/invoices.png) | ![Confirming](docs/screenshots/confirming.png) |
+| ![Presence](docs/screenshots/presence.png) | ![Conflict](docs/screenshots/conflict.png) |
+
+| Offline banner |
+|---|
+| ![Offline](docs/screenshots/offline.png) |
 
 ## Local Setup
 
@@ -335,11 +431,13 @@ npx prisma generate
 # 6. Seed realistic test organizations
 npx prisma db seed
 
-# 7. Start the dev server
-npm run dev
+# 7. Start the Next.js app and the realtime server together
+npm run dev:all
 ```
 
 On Windows PowerShell, use `Copy-Item .env.example .env` for step 2. Open [http://localhost:3000](http://localhost:3000).
+
+Scripts: `npm run dev` (Next.js only), `npm run realtime` (Socket.io only), `npm run dev:all` (both), `npm test` (Vitest).
 
 ### Environment Variables
 
@@ -352,9 +450,11 @@ On Windows PowerShell, use `Copy-Item .env.example .env` for step 2. Open [http:
 | `STRIPE_WEBHOOK_SECRET` | Webhook signing secret (`whsec_...`) printed by `stripe listen` |
 | `STRIPE_PRICE_PRO` | Stripe price ID of the Pro plan (`price_...`) |
 | `STRIPE_PRICE_BUSINESS` | Stripe price ID of the Business plan (`price_...`) |
-| `APP_URL` | Base URL used for Stripe redirect links, e.g. `http://localhost:3000` |
+| `APP_URL` | Base URL used for Stripe redirects and socket CORS, e.g. `http://localhost:3000` |
+| `REALTIME_PORT` | Port of the Socket.io server (default `4000`) |
+| `NEXT_PUBLIC_REALTIME_URL` | Socket server URL used by the browser, e.g. `http://localhost:4000` |
 
-Variables are validated with Zod in `src/env.ts`; the app refuses to start if any are missing or invalid. Never commit real keys: `.env` is git-ignored and `.env.example` holds placeholders only.
+Variables are validated with Zod in `src/env.ts`; the app refuses to start if any are missing or invalid. Never commit real keys: `.env` is git-ignored and `.env.example` holds placeholders only. Restart both servers after changing `.env`.
 
 ### Stripe Setup (test mode)
 
@@ -362,13 +462,13 @@ Variables are validated with Zod in `src/env.ts`; the app refuses to start if an
 2. Copy the secret key from **Developers, API keys** into `STRIPE_SECRET_KEY`.
 3. Activate the **Customer portal** under **Settings, Billing, Customer portal**.
 4. Install the Stripe CLI and log in:
-```bash
+   ```bash
    stripe login
-```
+   ```
 5. With the dev server running, forward webhooks in a second terminal:
-```bash
+   ```bash
    stripe listen --forward-to localhost:3000/api/webhooks/stripe
-```
+   ```
    Copy the `whsec_...` it prints into `STRIPE_WEBHOOK_SECRET` and restart the dev server.
 
 ### Stripe Test Cards
@@ -392,6 +492,35 @@ stripe events resend evt_XXXXXXXX
 ```
 
 The resent event returns `"result":"duplicate"` and the database is unchanged.
+
+### Automated tests
+
+```bash
+npm test
+```
+
+The suite in `src/realtime/realtime.test.ts` starts a real Socket.io server on a random port with an in-memory store and connects real `socket.io-client` instances. It needs no database or Docker. It asserts:
+
+- **Authentication:** connections without a valid session are rejected.
+- **Broadcasting:** a saved note reaches other viewers but is not echoed to the sender; typing indicators reach others only.
+- **State sync:** a late joiner receives the current note.
+- **Presence:** viewers joining and leaving update everyone, with one avatar per user across tabs.
+- **Tenant isolation:** another organization cannot join the room, save to it, or receive its events.
+- **Concurrency:** a stale save returns `CONFLICT` with the latest note, a rebased save succeeds, and of two simultaneous saves exactly one wins.
+- **Reconnection:** after a dropped connection the client reconnects, rejoins, and receives edits made while it was away.
+
+### Manual realtime test
+
+Use a normal window and an incognito window (the session cookie is shared within one browser profile). Log in as two users of `lahore-dental`, open the same booking, then:
+
+| Test | Expected |
+|---|---|
+| Both open the booking | Both avatars appear in both windows |
+| Type in one window | The other shows "... is typing" and the text appears live |
+| Both edit at once | The second saver sees the conflict banner |
+| DevTools, Network, Offline | Red offline banner; edits sync after going online |
+| Stop and restart `npm run realtime` | Amber "Reconnecting..." banner, then recovery |
+| Log in as `peak-fitness` and open the same booking URL | 404, no events from the other organization |
 
 ### Demo Logins
 
@@ -420,6 +549,7 @@ Run it twice: the second response has the same booking `id` and an `Idempotent-R
 ```
 prisma/                      schema, migrations (incl. RLS), seed
 docker/init.sql              creates the app_user role
+vitest.config.ts             test configuration
 src/env.ts                   Zod env validation
 src/lib/db.ts                Prisma client and withTenant()
 src/lib/api.ts               ApiError and handle() error wrapper
@@ -427,19 +557,28 @@ src/lib/session.ts           JWT session cookie
 src/lib/stripe.ts            Stripe client
 src/lib/plans.ts             Plan definitions and price-ID mapping
 src/lib/billing.ts           React Query hooks for billing and polling
+src/lib/socket.ts            Socket.io client singleton
+src/lib/useBookingNote.ts    Hook: autosave, typing, presence, conflicts, reconnection
 src/lib/validators/          Zod schemas
+src/realtime/createRealtime.ts  Socket.io server core (injected auth and store)
+src/realtime/prismaStore.ts     Prisma-backed note store with version check
+src/realtime/cookieAuth.ts      JWT cookie authentication for sockets
+src/realtime/server.ts          Entry point for the realtime process
+src/realtime/realtime.test.ts   Multi-user broadcast and sync tests
 src/app/api/                 auth, booking and billing route handlers
 src/app/api/webhooks/stripe  signed webhook handler
 src/app/bookings/            calendar, create, detail, edit pages
 src/app/pricing/             plans page and checkout flow
 src/app/billing/             current plan, portal link, invoice history
-src/components/              BookingForm, ConfirmDialog, StatusBadge
+src/components/              BookingForm, BookingNotes, ConfirmDialog, StatusBadge
 docs/                        Postman collection and screenshots
 ```
 
 ## Known Limitations
 
+- Presence and rooms live in the memory of one realtime process. Running several instances would need the Socket.io Redis adapter.
+- Notes are plain text with whole-note conflict resolution. Merging concurrent edits character by character would need a CRDT such as Yjs.
 - Password reset and organization onboarding screens are not part of this scope.
-- The isolation test script is not yet automated.
+- The tenant isolation test script is not yet automated against the real database.
 - Stripe runs in test mode only; no live keys are configured.
-- Booking limits per plan are defined in `src/lib/plans.ts`, but enforcement on `POST /api/bookings` is optional and only active if implemented.
+- Booking limits per plan are defined in `src/lib/plans.ts`, but enforcement on `POST /api/bookings` is optional.
